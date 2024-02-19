@@ -1,0 +1,91 @@
+<policies>
+    <inbound>
+        <base />
+        <!-- Getting the main variable where we keep the list of backends -->
+        <cache-lookup-value key="listBackends" variable-name="listBackends" />
+        <!-- If we can't find the variable, initialize it -->
+        <choose>
+            <when condition="@(context.Variables.ContainsKey("listBackends") == false)">
+                <set-variable name="listBackends" value="@{
+                    JArray backends = new JArray();
+                    backends.Add(new JObject()
+                    {
+                        { "url", "OpenAI URL" },
+                        { "priority", 1},
+                        { "isThrottling", false }, 
+                        { "isNotFound", false }, 
+                        { "retryAfter", DateTime.MinValue } 
+                    });
+
+                    backends.Add(new JObject()
+                    {
+                        { "url", "OpenAI URL" },
+                        { "priority", 2},
+                        { "isThrottling", false },
+                        { "isNotFound", false }, 
+                        { "retryAfter", DateTime.MinValue }
+                    });
+
+                    return backends;   
+                }" />
+                <!-- And store the variable into cache again -->
+                <cache-store-value key="listBackends" value="@((JArray)context.Variables["listBackends"])" duration="60" />
+            </when>
+        </choose>
+        <authentication-managed-identity resource="https://cognitiveservices.azure.com" output-token-variable-name="msi-access-token" ignore-error="false" />
+        <set-header name="Authorization" exists-action="override">
+            <value>@("Bearer " + (string)context.Variables["msi-access-token"])</value>
+        </set-header>
+        <set-variable name="backendIndex" value="-1" />
+        <set-variable name="remainingBackends" value="1" />
+    </inbound>
+    <backend>
+        <retry condition="@(context.Response != null && (context.Response.StatusCode == 429 || context.Response.StatusCode == 404 || context.Response.StatusCode >= 500) && ((Int32)context.Variables["remainingBackends"]) > 0)" count="50" interval="0">
+            <choose>
+                <when condition="@(context.Response != null && (context.Response.StatusCode == 429 || context.Response.StatusCode == 404 || context.Response.StatusCode >= 500) )">
+                    <cache-lookup-value key="listBackends" variable-name="listBackends" />
+                    <set-variable name="listBackends" value="@{
+                        JArray backends = (JArray)context.Variables["listBackends"];
+                        int currentBackendIndex = context.Variables.GetValueOrDefault<int>("backendIndex");
+                        int retryAfter = Convert.ToInt32(context.Response.Headers.GetValueOrDefault("Retry-After", "-1"));
+
+                        if (retryAfter == -1)
+                        {
+                            retryAfter = Convert.ToInt32(context.Response.Headers.GetValueOrDefault("x-ratelimit-reset-requests", "-1"));
+                        }
+
+                        if (retryAfter == -1)
+                        {
+                            retryAfter = Convert.ToInt32(context.Response.Headers.GetValueOrDefault("x-ratelimit-reset-tokens", "10"));
+                        }
+
+                        JObject backend = (JObject)backends[currentBackendIndex];
+                        backend["isThrottling"] = context.Response.StatusCode == 429;
+                        backend["isNotFound"] = context.Response.StatusCode == 404;
+                        backend["retryAfter"] = DateTime.Now.AddSeconds(retryAfter);
+
+                        return backends;      
+                    }" />
+                </when>
+            </choose>
+            <send-request mode="new" response-variable-name="backendResponse" timeout="20" ignore-error="true">
+                <set-url>@(context.Variables.GetValueOrDefault<string>("backendUrl"))</set-url>
+                <set-method>@(context.Request.Method)</set-method>
+                <set-header name="Authorization" exists-action="override">
+                    <value>@("Bearer " + (string)context.Variables["msi-access-token"])</value>
+                </set-header>
+                <set-body>@(context.Request.Body.As<string>())</set-body>
+            </send-request>
+        </retry>
+    </backend>
+   <outbound>
+        <base />
+        <!-- This will return the used backend URL in the HTTP header response. Remove it if you don't want to expose this data -->
+        <set-header name="x-openai-backendurl" exists-action="override">
+            <value>@(context.Variables.GetValueOrDefault<string>("backendUrl", "none"))</value>
+        </set-header>
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>
